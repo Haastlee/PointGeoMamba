@@ -2,35 +2,54 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 def knn(x, k):
+    """
+    x: (B, N, 3)
+    return: (B, N, k_eff)
+    """
     B, N, _ = x.shape
     k_eff = min(k, N)
-    dist = torch.cdist(x, x, p=2)                      # (B, N, N)
-    _, idx = torch.topk(dist, k=k_eff, largest=False)  # (B, N, k_eff)
-    return idx
+    dist = torch.cdist(x, x, p=2)
+    return dist.topk(k=k_eff, dim=-1, largest=False, sorted=True).indices
+
 
 def index_points(points, idx):
+    """
+    points: (B, N, C)
+    idx:    (B, N, K)
+    return: (B, N, K, C)
+    """
     B, N, C = points.shape
-    k_eff = idx.shape[-1]
-    batch_offset = (torch.arange(B, device=points.device) * N) \
-                       .view(B,1,1)
-    idx_flat = (idx + batch_offset).view(-1)
-    return points.view(B*N, C)[idx_flat].view(B, N, k_eff, C)
+    K = idx.shape[-1]
+    batch_offset = (torch.arange(B, device=points.device) * N).view(B, 1, 1)
+    idx_flat = (idx + batch_offset).reshape(-1)
+    return points.reshape(B * N, C)[idx_flat].reshape(B, N, K, C)
+
 
 class PointENAblock(nn.Module):
-    def __init__(self, channels, knn_k=8, gamma_init=0.92):
+    def __init__(self, channels, knn_k=8, gamma_init=0.86):
         super().__init__()
-        self.C  = channels
-        self.k  = knn_k
+        if not 0.0 < gamma_init < 1.0:
+            raise ValueError("gamma_init must be in (0, 1).")
 
-        # Q/K/V & 输出投射
-        self.q_proj   = nn.Linear(channels, channels, bias=False)
-        self.k_proj   = nn.Linear(channels, channels, bias=False)
-        self.v_proj   = nn.Linear(channels, channels, bias=False)
+        self.C = channels
+        self.k = knn_k
+
+        # Q/K/V projections and output projection
+        self.q_proj = nn.Linear(channels, channels, bias=False)
+        self.k_proj = nn.Linear(channels, channels, bias=False)
+        self.v_proj = nn.Linear(channels, channels, bias=False)
         self.out_proj = nn.Linear(channels, channels, bias=False)
 
-        # 可训练 gamma：存 log_gamma
-        self.log_gamma = nn.Parameter(torch.log(torch.tensor(gamma_init, dtype=torch.float32)))
+        # Learnable unconstrained parameter eta:
+        # gamma = sigmoid(eta) is always in (0, 1).
+        eta_init = torch.logit(torch.tensor(float(gamma_init), dtype=torch.float32))
+        self.eta = nn.Parameter(eta_init)
+
+    @property
+    def gamma(self):
+        return torch.sigmoid(self.eta)
 
     def forward(self, feats, coords):
         """
@@ -39,41 +58,53 @@ class PointENAblock(nn.Module):
         """
         B, N, C = feats.shape
 
-        q = self.q_proj(feats)           # (B, N, C)
-        k = self.k_proj(feats)
-        v = self.v_proj(feats)
+        q = self.q_proj(feats)                         # (B, N, C)
+        key = self.k_proj(feats)                       # (B, N, C)
+        v = self.v_proj(feats)                         # (B, N, C)
 
-        idx        = knn(coords, self.k)           # (B, N, k_eff)
-        k_neigh    = index_points(k, idx)          # (B, N, k_eff, C)
-        v_neigh    = index_points(v, idx)          # (B, N, k_eff, C)
-        coord_neigh= index_points(coords, idx)     # (B, N, k_eff, 3)
+        idx = knn(coords, self.k)                      # (B, N, K)
+        key_neigh = index_points(key, idx)             # (B, N, K, C)
+        v_neigh = index_points(v, idx)                 # (B, N, K, C)
+        coord_neigh = index_points(coords, idx)        # (B, N, K, 3)
 
-        dist = torch.norm(coords.unsqueeze(2) - coord_neigh, dim=-1)  # (B, N, k_eff)
+        # Euclidean distances d_ij
+        dist = torch.norm(
+            coords.unsqueeze(2) - coord_neigh, dim=-1
+        )                                               # (B, N, K)
 
-        gamma_w = torch.exp(self.log_gamma * dist)                    # (B, N, k_eff)
+        # Content similarity: Q_i^T K_j / sqrt(C)
+        content_scores = (
+            q.unsqueeze(2) * key_neigh
+        ).sum(dim=-1) / (C ** 0.5)                     # (B, N, K)
 
-        scores = (q.unsqueeze(2) * k_neigh).sum(-1) / (C ** 0.5)      # (B, N, k_eff)
-        scores = scores * gamma_w
+        # Additive distance bias:
+        # b_ij = log(w_ij) = d_ij * log(gamma)
+        # F.logsigmoid(eta) computes log(sigmoid(eta)) stably.
+        log_gamma = F.logsigmoid(self.eta)
+        distance_bias = dist * log_gamma               # (B, N, K)
 
-        weights = F.softmax(scores, dim=2)                           # (B, N, k_eff)
-        agg     = (weights.unsqueeze(-1) * v_neigh).sum(2)           # (B, N, C)
+        # Paper formulation: content similarity + distance bias
+        scores = content_scores + distance_bias
 
-        # 6) 输出
-        out = self.out_proj(agg)                                     # (B, N, C)
-        return out
+        # Neighborhood attention and feature aggregation
+        weights = F.softmax(scores, dim=2)             # (B, N, K)
+        agg = (weights.unsqueeze(-1) * v_neigh).sum(dim=2)
+
+        return self.out_proj(agg)                      # (B, N, C)
+
 
 class PointENA(nn.Module):
-    def __init__(self, channels, knn_k=8, gamma_init=0.92, activation='relu'):
+    def __init__(self, channels, knn_k=8, gamma_init=0.86, activation="relu"):
         super().__init__()
         self.attn = PointENAblock(channels, knn_k, gamma_init)
-        self.act  = getattr(F, activation)
+        self.act = getattr(F, activation)
 
     def forward(self, x_feats, x_coords):
         """
-        x_feats: (B, C, N)
-        x_coords:(B, N, 3)
+        x_feats:  (B, C, N)
+        x_coords: (B, N, 3)
         """
-        feats = x_feats.permute(0,2,1).contiguous()  # (B, N, C)
-        out   = self.attn(feats, x_coords)           # (B, N, C)
-        out   = out.permute(0,2,1).contiguous()       # (B, C, N)
+        feats = x_feats.transpose(1, 2).contiguous()   # (B, N, C)
+        out = self.attn(feats, x_coords)                # (B, N, C)
+        out = out.transpose(1, 2).contiguous()         # (B, C, N)
         return self.act(out + x_feats)
