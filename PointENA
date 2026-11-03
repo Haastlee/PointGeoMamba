@@ -1,0 +1,85 @@
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def knn(x, k):
+    B, N, _ = x.shape
+    dist = torch.cdist(x, x, p=2)
+    dist.diagonal(dim1=1, dim2=2).fill_(float('inf'))
+    return torch.topk(dist, k=min(k, N - 1), largest=False).indices
+
+
+def index_points(points, idx):
+    B, N, C = points.shape
+    batch_idx = torch.arange(B, device=points.device).view(B, 1, 1)
+    return points[batch_idx, idx]
+
+
+class PointENA(nn.Module):
+    def __init__(self, channels, knn_k=8, gamma_init=0.86, eps=1e-6):
+        super().__init__()
+        self.C = channels
+        self.k = knn_k
+        self.eps = eps
+
+        self.q_proj = nn.Linear(channels, channels, bias=False)
+        self.k_proj = nn.Linear(channels, channels, bias=False)
+        self.v_proj = nn.Linear(channels, channels, bias=False)
+        self.out_proj = nn.Linear(channels, channels, bias=False)
+
+        if not eps < gamma_init < 1 - eps:
+            raise ValueError("gamma_init must be within (eps, 1-eps)")
+
+        p = (gamma_init - eps) / (1 - 2 * eps)
+        raw_init = math.log(p / (1 - p))
+        self.raw_gamma = nn.Parameter(torch.tensor(raw_init, dtype=torch.float32))
+
+    def forward(self, feats, coords):
+        B, N, C = feats.shape
+
+        # 1. Q/K/V projections
+        q = self.q_proj(feats)
+        k = self.k_proj(feats)
+        v = self.v_proj(feats)
+
+        # 2. KNN neighborhood
+        idx = knn(coords, self.k)
+        k_neigh = index_points(k, idx)
+        v_neigh = index_points(v, idx)
+        coord_neigh = index_points(coords, idx)
+
+        # 3. Euclidean distance
+        dist = torch.norm(coords.unsqueeze(2) - coord_neigh, dim=-1)
+
+        # 4. Bounded learnable gamma
+        gamma = self.eps + (1 - 2 * self.eps) * torch.sigmoid(self.raw_gamma)
+        log_gamma = torch.log(gamma)
+
+        # 5. Q-K similarity
+        scores = (q.unsqueeze(2) * k_neigh).sum(dim=-1) / math.sqrt(C)
+
+        # 6. Distance modulation for positive and negative similarities
+        gamma_w = torch.exp(torch.sign(scores) * log_gamma * dist)
+        scores = scores * gamma_w
+
+        # 7. Neighborhood attention
+        weights = F.softmax(scores, dim=-1)
+        agg = (weights.unsqueeze(-1) * v_neigh).sum(dim=2)
+
+        # 8. Output projection
+        return self.out_proj(agg)
+
+
+class PointENABlock(nn.Module):
+    def __init__(self, channels, knn_k=8, gamma_init=0.86, activation='relu'):
+        super().__init__()
+        self.attn = PointENA(channels, knn_k, gamma_init)
+        self.act = getattr(F, activation)
+
+    def forward(self, x_feats, x_coords):
+        feats = x_feats.permute(0, 2, 1).contiguous()
+        out = self.attn(feats, x_coords)
+        out = out.permute(0, 2, 1).contiguous()
+        return self.act(out + x_feats)
